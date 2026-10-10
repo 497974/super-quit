@@ -2,6 +2,7 @@
 
 const KEY = 'superquit.v1';
 const HINT_KEY = 'superquit.hideInstallHint';
+const SOS_KEY = 'superquit.sos';
 const SOS_SECONDS = 240;
 const BREATH_CYCLE = 14; // 吸气 4 秒、屏住 4 秒、呼气 6 秒
 const DAY = 864e5;
@@ -295,14 +296,32 @@ function toAsk(timeUp) {
   renderSOS();
 }
 
+// 急救进行中的状态存起来：她切出去发消息时 iOS 可能会把页面杀掉，回来要能接着走
+function persistSOS() {
+  try {
+    if (sos) localStorage.setItem(SOS_KEY, JSON.stringify(sos));
+    else localStorage.removeItem(SOS_KEY);
+  } catch {}
+}
+function restoreSOS() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SOS_KEY));
+    if (s && db.profile && Date.now() - s.t0 < 3600e3) sos = s;
+    else localStorage.removeItem(SOS_KEY);
+  } catch {}
+}
+
+let shownPhase = null;
 function renderSOS() {
   const o = $('#overlay');
   document.body.classList.toggle('lock', !!sos);
-  if (!sos) { o.hidden = true; o.innerHTML = ''; return; }
+  persistSOS();
+  if (!sos) { o.hidden = true; o.innerHTML = ''; shownPhase = null; return; }
   o.hidden = false;
   o.innerHTML = sosView();
-  o.scrollTop = 0;
-  if (sos.phase === 'breathe') tickSOS();
+  if (shownPhase !== sos.phase) { o.scrollTop = 0; shownPhase = sos.phase; }
+  sos.shownTip = null; // 新渲染的卡片是空的，要重新填
+  if (sos.phase === 'breathe') { keepAwake(true); tickSOS(); }
 }
 
 function sosView() {
@@ -429,7 +448,7 @@ const actions = {
   },
   'sos-outcome'(v) { sos.outcome = v; sos.phase = 'detail'; renderSOS(); },
   'sos-tip'() { sos.tip++; tickSOS(); },
-  'sos-count'(v) { sos.count = Math.max(1, Math.min(40, sos.count + Number(v))); $('#sos-count').textContent = sos.count; },
+  'sos-count'(v) { sos.count = Math.max(1, Math.min(40, sos.count + Number(v))); $('#sos-count').textContent = sos.count; persistSOS(); },
   'sos-trigger'(v) { sos.trigger = sos.trigger === v ? null : v; renderSOS(); },
   'sos-save'() { saveSOS(); },
   'sos-close'() { closeSOS(); },
@@ -515,7 +534,7 @@ setInterval(() => {
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
-  if (sos?.phase === 'breathe') { keepAwake(true); renderSOS(); }
+  if (sos?.phase === 'breathe') renderSOS();
   else if (!sos && view === 'home') render();
 });
 
@@ -525,3 +544,5 @@ if ('serviceWorker' in navigator) {
 }
 
 render();
+restoreSOS();
+if (sos) renderSOS();
