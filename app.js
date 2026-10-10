@@ -38,15 +38,36 @@ const isStandalone = () => navigator.standalone === true || matchMedia('(display
 // ---------- 数据 ----------
 function emptyDb() { return { profile: null, cravings: [], slips: [] }; }
 function load() {
-  try {
-    const d = JSON.parse(localStorage.getItem(KEY));
-    if (d && typeof d === 'object') return { profile: d.profile || null, cravings: d.cravings || [], slips: d.slips || [] };
-  } catch {}
-  return emptyDb();
+  try { return cleanBackup(JSON.parse(localStorage.getItem(KEY))) || emptyDb(); } catch { return emptyDb(); }
 }
 let db = load();
 function save() {
   try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { toast('保存失败：' + e.message); }
+}
+
+// 恢复备份时逐项检查，粘贴进来的内容不完整或被改过也不会把页面弄坏
+function cleanBackup(d) {
+  const p = d && d.profile;
+  const iso = v => { const t = new Date(v); return isNaN(t) ? null : t.toISOString(); };
+  const num = (v, min) => { const n = Number(v); return Number.isFinite(n) && n >= min ? n : null; };
+  if (!p || !iso(p.quitAt) || !num(p.perDay, 1) || !num(p.perPack, 1) || num(p.packPrice, 0) === null) return null;
+  const cravings = (Array.isArray(d.cravings) ? d.cravings : [])
+    .filter(c => c && iso(c.at) && (c.outcome === 'beat' || c.outcome === 'smoked'))
+    .map(c => ({
+      id: String(c.id || uid()), at: iso(c.at), sec: Math.round(num(c.sec, 0) || 0), outcome: c.outcome,
+      trigger: TRIGGERS.includes(c.trigger) ? c.trigger : null, manual: !!c.manual,
+    }));
+  const slips = (Array.isArray(d.slips) ? d.slips : [])
+    .filter(s => s && iso(s.at) && num(s.count, 1))
+    .map(s => ({ id: String(s.id || uid()), at: iso(s.at), count: Math.round(num(s.count, 1)), cravingId: s.cravingId ? String(s.cravingId) : null }));
+  return {
+    profile: {
+      name: String(p.name || 'Super').slice(0, 20), perDay: num(p.perDay, 1), perPack: num(p.perPack, 1),
+      packPrice: num(p.packPrice, 0), quitAt: iso(p.quitAt),
+      reasons: (Array.isArray(p.reasons) ? p.reasons : []).map(r => String(r).slice(0, 60)).filter(Boolean).slice(0, 3),
+    },
+    cravings, slips,
+  };
 }
 
 // ---------- 时间和统计 ----------
@@ -136,10 +157,10 @@ function profileForm(p) {
   return `<form id="profile" class="card form">
     <label>怎么称呼你<input name="name" value="${esc(p?.name ?? 'Super')}" maxlength="20" required></label>
     <div class="row">
-      <label>以前每天抽几根<input name="perDay" type="number" inputmode="numeric" min="1" max="100" value="${p?.perDay ?? ''}" placeholder="10" required></label>
-      <label>一包几根<input name="perPack" type="number" inputmode="numeric" min="1" max="100" value="${p?.perPack ?? 20}" required></label>
+      <label>以前每天抽几根<input name="perDay" type="number" inputmode="numeric" min="1" max="100" step="1" value="${p?.perDay ?? ''}" placeholder="10" required></label>
+      <label>一包几根<input name="perPack" type="number" inputmode="numeric" min="1" max="100" step="1" value="${p?.perPack ?? 20}" required></label>
     </div>
-    <label>一包多少钱（元）<input name="packPrice" type="number" inputmode="decimal" min="0" step="0.1" value="${p?.packPrice ?? ''}" placeholder="25" required></label>
+    <label>一包多少钱（元）<input name="packPrice" type="number" inputmode="decimal" min="0" max="10000" step="any" value="${p?.packPrice ?? ''}" placeholder="25" required></label>
     <label>从什么时候开始戒<input name="quitAt" type="datetime-local" value="${toLocalInput(p ? new Date(p.quitAt) : new Date())}" required></label>
     <fieldset>
       <legend>为什么想戒烟？写给以后想抽烟的自己</legend>
@@ -277,7 +298,6 @@ function startSOS(manual, outcome) {
     phase: manual ? 'detail' : 'breathe', outcome: outcome || null,
     trigger: null, count: 1, tip: Math.floor(Math.random() * 100), shownTip: null, timeUp: false,
   };
-  if (!manual) keepAwake(true);
   renderSOS();
 }
 
@@ -360,7 +380,7 @@ function sosView() {
       <p class="muted">是什么让你想抽？（可以不选）</p>
       <div class="chips">${TRIGGERS.map(t => `<button class="chip${sos.trigger === t ? ' on' : ''}" data-action="sos-trigger" data-v="${t}">${t}</button>`).join('')}</div>
       <button class="primary" data-action="sos-save">完成</button>
-      ${sos.manual ? '<button class="link" data-action="sos-close">取消</button>' : ''}
+      ${sos.manual ? '<button class="link" data-action="sos-close">取消</button>' : '<button class="link" data-action="sos-reask">点错了，返回</button>'}
     </div>`;
   }
   // done
@@ -412,17 +432,24 @@ function saveSOS() {
   renderSOS();
 }
 
-let wakeLock = null;
+// 急救时屏幕常亮。申请是异步的，连着调用多次时只能持有一把锁，否则结束后屏幕一直不熄
+let wakeLock = null, wantAwake = false, requesting = false;
 async function keepAwake(on) {
-  try {
-    if (on && !wakeLock && 'wakeLock' in navigator) {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', () => { wakeLock = null; });
-    } else if (!on && wakeLock) {
-      await wakeLock.release();
-      wakeLock = null;
-    }
-  } catch {}
+  wantAwake = on;
+  if (on && !wakeLock && !requesting && 'wakeLock' in navigator) {
+    requesting = true;
+    try {
+      const lock = await navigator.wakeLock.request('screen');
+      lock.addEventListener('release', () => { if (wakeLock === lock) wakeLock = null; });
+      wakeLock = lock;
+    } catch {}
+    requesting = false;
+  }
+  if (!wantAwake && wakeLock) {
+    const lock = wakeLock;
+    wakeLock = null;
+    lock.release().catch(() => {});
+  }
 }
 
 // ---------- 交互 ----------
@@ -443,10 +470,10 @@ const actions = {
   'sos-back'() {
     if (sos.timeUp) { sos.carry += SOS_SECONDS; sos.start = Date.now(); }
     sos.phase = 'breathe';
-    keepAwake(true);
     renderSOS();
   },
   'sos-outcome'(v) { sos.outcome = v; sos.phase = 'detail'; renderSOS(); },
+  'sos-reask'() { sos.phase = 'ask'; sos.count = 1; renderSOS(); },
   'sos-tip'() { sos.tip++; tickSOS(); },
   'sos-count'(v) { sos.count = Math.max(1, Math.min(40, sos.count + Number(v))); $('#sos-count').textContent = sos.count; persistSOS(); },
   'sos-trigger'(v) { sos.trigger = sos.trigger === v ? null : v; renderSOS(); },
@@ -468,10 +495,10 @@ const actions = {
   'import-open'() { $('#import').hidden = false; $('#import-text').focus(); },
   import() {
     let d;
-    try { d = JSON.parse($('#import-text').value); } catch {}
-    if (!d || !d.profile || !d.profile.quitAt) return toast('内容不对，没法恢复');
+    try { d = cleanBackup(JSON.parse($('#import-text').value.trim())); } catch {}
+    if (!d) return toast('内容不对，没法恢复');
     if (!confirm('用备份覆盖现在的数据？')) return;
-    db = { profile: d.profile, cravings: d.cravings || [], slips: d.slips || [] };
+    db = d;
     save();
     view = 'home';
     homeReason = null;
@@ -493,6 +520,12 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-action]');
   if (el && actions[el.dataset.action]) actions[el.dataset.action](el.dataset.v, el);
 });
+
+// iOS 上要有 touchstart 监听，按钮的 :active 按下效果才会出现
+document.addEventListener('touchstart', () => {}, { passive: true });
+// 打字时把底部导航藏起来，不然它会飘在键盘上面挡住输入框
+document.addEventListener('focusin', e => { if (e.target.matches('input, textarea')) document.body.classList.add('typing'); });
+document.addEventListener('focusout', () => document.body.classList.remove('typing'));
 
 document.addEventListener('submit', e => {
   if (e.target.id !== 'profile') return;

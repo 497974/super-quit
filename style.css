@@ -38,6 +38,9 @@ body {
 }
 body.lock { overflow: hidden; }
 [hidden] { display: none !important; }
+/* iOS Safari 只给带 pointer 的元素派发点击，卡片这种非按钮元素必须加 */
+[data-action] { cursor: pointer; }
+body.typing #tabbar { display: none; }
 
 #app {
   max-width: 520px;
